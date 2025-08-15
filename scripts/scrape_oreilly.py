@@ -18,7 +18,7 @@ import argparse
 import asyncio
 from urllib.parse import urljoin
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -35,27 +35,59 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, timeout: int = 20
         return await resp.text()
 
 
-def extract_book_links(list_html: str, base_url: str = "https://www.oreilly.com") -> List[Tuple[str, str]]:
+def extract_book_entries(list_html: str, base_url: str = "https://www.oreilly.com") -> List[Dict[str, Optional[str]]]:
+    """Extract book link entries (url, link_text, animal) from a list/search page.
+
+    Bug fix: Animal names actually reside on the list (search results) pages, not on
+    the individual book detail pages. Previously we attempted to parse the
+    <p class="animal-name"> tag from the book page (often missing), resulting in
+    blank animal fields. We now capture the animal name while scanning the list page
+    and propagate it as a hint when fetching the book page.
+    """
     soup = BeautifulSoup(list_html, 'html.parser')
-    links: List[Tuple[str, str]] = []
+    entries: List[Dict[str, Optional[str]]] = []
     for a in soup.find_all('a', href=True):
         href = a['href']
-        if '/library/view/' in href:
-            full = urljoin(base_url, href)
-            text = (a.get_text() or '').strip()
-            links.append((full, text))
-    # preserve order while deduping
-    seen = set(); out: List[Tuple[str,str]] = []
-    for u,t in links:
+        if '/library/view/' not in href:
+            continue
+        full = urljoin(base_url, href)
+        text = (a.get_text() or '').strip()
+
+        # Heuristic: climb a few ancestor levels looking for a p.animal-name
+        animal = None
+        container = a
+        for _ in range(5):  # limit climb depth
+            if container is None:
+                break
+            animal_tag = container.find('p', class_='animal-name') if container else None
+            if animal_tag and animal_tag.get_text(strip=True):
+                animal = animal_tag.get_text(strip=True)
+                break
+            container = container.parent
+
+        entries.append({'url': full, 'text': text, 'animal': animal})
+
+    # Deduplicate by URL preserving first occurrence (with its animal/text)
+    seen = set(); out: List[Dict[str, Optional[str]]] = []
+    for e in entries:
+        u = e['url']
         if u not in seen:
-            seen.add(u); out.append((u,t))
+            seen.add(u); out.append(e)
     return out
 
 
-def extract_cover_and_title(book_html: str, book_url: str):
+def extract_cover_title_animal(book_html: str, book_url: str):
+    """Return (cover, title, animal) from a book detail page.
+
+    Note: Animal name is often not present on the book page itself. We still try
+    to extract it (legacy behavior) but usually rely on the list-page provided
+    hint captured earlier.
+    """
     soup = BeautifulSoup(book_html, 'html.parser')
     og = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name':'og:image'})
-    cover = og['content'] if og and og.get('content') else None
+    cover = None
+    if og and hasattr(og, 'get'):
+        cover = og.get('content')
     if not cover:
         imgs = soup.find_all('img')
         for img in imgs:
@@ -64,15 +96,28 @@ def extract_cover_and_title(book_html: str, book_url: str):
             if 'cover' in s or 'oreilly' in s or 'book' in s:
                 cover = urljoin(book_url, src)
                 break
+
     title = None
     t = soup.find('title')
-    if t and t.string:
-        title = t.string.strip()
+    if t:
+        try:
+            # prefer .get_text() for robustness
+            extracted = t.get_text(strip=True)
+            if extracted:
+                title = extracted
+        except Exception:
+            pass
     if (not title or len(title) < 3):
         h1 = soup.find(['h1','h2'])
         if h1 and h1.get_text():
             title = h1.get_text().strip()
-    return cover, title
+
+    animal = None
+    p = soup.find('p', class_='animal-name')
+    if p:
+        animal = p.get_text().strip()
+
+    return cover, title, animal
 
 
 def render_markdown(items, out_path):
@@ -87,12 +132,22 @@ def render_markdown(items, out_path):
             title = it.get('title') or ''
             cover = it.get('cover')
             url = it.get('url')
+            animal = it.get('animal') if it.get('animal') else None
             f.write('<div style="border:1px solid #ddd;padding:8px;border-radius:6px;background:#fff;">')
             if cover:
                 f.write(f'<a href="{url}" target="_blank" rel="noopener noreferrer"><img src="{cover}" alt="{title}" style="width:100%;height:260px;object-fit:cover;border-radius:4px;" loading="lazy"></a>')
             else:
-                f.write(f'<div style="width:100%;height:260px;background:#f6f6f6;display:flex;align-items:center;justify-content:center;color:#999;border-radius:4px;">No cover</div>')
-            f.write(f'<div style="margin-top:8px;font-size:0.95rem;color:#222"><a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a></div>')
+                f.write('<div style="width:100%;height:260px;background:#f6f6f6;display:flex;align-items:center;justify-content:center;color:#999;border-radius:4px;">No cover</div>')
+            # Text block: animal first (larger), then book title (smaller)
+            f.write('<div style="margin-top:8px;">')
+            if animal:
+                f.write(f'<div style="font-size:1.05rem;font-weight:600;line-height:1.1;color:#1a1a1a;">{animal}</div>')
+            f.write(
+                f'<div style="font-size:0.9rem;line-height:1.2;">'
+                f'<a href="{url}" target="_blank" rel="noopener noreferrer" style="color:#0366d6;text-decoration:underline;">{title}</a>'
+                f'</div>'
+            )
+            f.write('</div>')  # end text block
             f.write('</div>\n')
         f.write('</div>\n')
 
@@ -113,22 +168,26 @@ async def gather_list_pages(session: aiohttp.ClientSession, concurrency: int = 6
     return results
 
 
-async def fetch_book(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore, delay: float = 0.0, fallback_text: str = None):
+async def fetch_book(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore, delay: float = 0.0,
+                     fallback_text: Optional[str] = None, animal_hint: Optional[str] = None):
     """Fetch a single book page. On success return dict with url/cover/title.
     On failure return None (so caller can omit the book entirely).
     """
     async with sem:
         try:
             html = await fetch_text(session, url)
-            cover, title = extract_cover_and_title(html, url)
+            cover, title, animal = extract_cover_title_animal(html, url)
             # use fallback text when title not found
             if not title:
                 title = fallback_text or url
+            # prefer already captured animal hint if page lacked it
+            if not animal:
+                animal = animal_hint
             # omit if no cover found
             if not cover:
                 print('  no cover, skipping', url)
                 return None
-            return {'url': url, 'cover': cover, 'title': title}
+            return {'url': url, 'cover': cover, 'title': title, 'animal': animal}
         except Exception as e:
             print('  failed', url, e)
             return None
@@ -143,24 +202,20 @@ async def main_async(max_items: int, out: str, concurrency: int):
     async with aiohttp.ClientSession(headers=HEADERS, connector=connector, timeout=timeout) as session:
         print('Fetching list pages...')
         list_results = await gather_list_pages(session, concurrency=min(6, concurrency))
-        book_links = []
+        book_entries = []
         for url, text in list_results:
             if text:
-                links = extract_book_links(text)
-                book_links.extend(links)
+                entries = extract_book_entries(text)
+                book_entries.extend(entries)
 
-        # dedupe preserving order
-        seen = set(); uniq = []
-        for u,t in book_links:
-            if u not in seen:
-                seen.add(u); uniq.append((u,t))
-        print(f'Found {len(uniq)} unique book links; limiting to {max_items}')
+        print(f'Found {len(book_entries)} unique book entries; limiting to {max_items}')
 
         sem = asyncio.Semaphore(concurrency)
         tasks = []
-        for i,(url,text) in enumerate(uniq[:max_items], start=1):
-            print(f'[{i}/{min(len(uniq),max_items)}] Scheduling {url}')
-            tasks.append(fetch_book(session, url, sem, delay=0.05, fallback_text=text))
+        for i, entry in enumerate(book_entries[:max_items], start=1):
+            url = entry['url']; text = entry.get('text'); animal_hint = entry.get('animal')
+            print(f'[{i}/{min(len(book_entries),max_items)}] Scheduling {url}')
+            tasks.append(fetch_book(session, url, sem, delay=0.05, fallback_text=text, animal_hint=animal_hint))
 
         raw_results = await asyncio.gather(*tasks)
         # filter out failed/omitted results (None)
